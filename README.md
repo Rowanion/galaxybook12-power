@@ -9,6 +9,11 @@ SM-W720 (i5-7200U, BIOS `P04HAC.000.180220`), Fedora 44, kernel 7.3.
 sudo ./install.sh      # safe to re-run; ./uninstall.sh reverts everything
 ```
 
+> **Fedora only.** Tested on Fedora 44 only. The power-cap script, udev rule and systemd units should work on
+> other distributions, but the install scripts are written for Fedora (TuneD for
+> the sleep fix, GNOME dconf for the power button, SELinux labels).
+> On other distributions they are untested and will likely fail.
+
 ## 1. Battery drains while charging
 
 **Measured:** charger connected, battery reported "Charging", yet it dropped
