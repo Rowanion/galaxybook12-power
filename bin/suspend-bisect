@@ -1,0 +1,52 @@
+#!/bin/bash
+# Find where S3 ("deep") suspend breaks, without risking a real S3 hang.
+#
+#   sudo ./suspend-bisect
+#
+# Uses the kernel's /sys/power/pm_test: each level runs the suspend sequence up
+# to that stage, waits 5 s, then resumes by itself. Levels go from shallow to
+# deep. The screen blanks for a few seconds per level; don't touch anything.
+#   freezer    - freeze tasks only
+#   devices    - + suspend/resume all drivers (camera, audio, touch, wifi ...)
+#   platform   - + ACPI firmware prepare/finish (_PTS/_WAK)
+#   processors - + take non-boot CPUs offline
+#   core       - + everything except actually cutting power
+# If every level passes, the hang is in real S3 power-off/firmware resume.
+# If the tablet hangs, force it off; after reboot run:  sudo ./suspend-bisect --last
+set -u
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+U="${SUDO_USER:-root}"; H="$(getent passwd "$U" | cut -d: -f6)"
+STATE=/var/lib/galaxybook-suspend-bisect   # survives a forced reboot
+REPORT="$H/suspend-bisect-$(date +%Y%m%d-%H%M).log"
+
+if [ "${1:-}" = --last ]; then
+  [ -f "$STATE" ] || { echo "No previous run recorded."; exit 0; }
+  echo "Last run's progress (last line = stage that hung, if it did not say PASS):"
+  cat "$STATE"; exit 0
+fi
+
+grep -qw deep /sys/power/mem_sleep || { echo "Firmware does not offer deep"; exit 1; }
+[ -w /sys/power/pm_test ] || { echo "Kernel has no pm_test (CONFIG_PM_DEBUG)"; exit 1; }
+
+OLD="$(sed -E 's/.*\[([a-z0-9]+)\].*/\1/' /sys/power/mem_sleep)"
+trap 'echo none > /sys/power/pm_test; echo "$OLD" > /sys/power/mem_sleep' EXIT
+: > "$STATE"
+echo deep > /sys/power/mem_sleep
+echo "=== suspend bisect $(date)  kernel $(uname -r)" | tee "$REPORT"
+
+for lvl in freezer devices platform processors core; do
+  echo "$(date +%T) START $lvl" >> "$STATE"; sync; journalctl --sync 2>/dev/null
+  echo "--- $lvl ..." | tee -a "$REPORT"
+  echo "$lvl" > /sys/power/pm_test
+  since="$(date '+%F %T')"
+  if echo mem > /sys/power/state 2>>"$REPORT"; then res=PASS; else res="FAIL (write error)"; fi
+  echo none > /sys/power/pm_test
+  sleep 3
+  echo "$(date +%T) $res $lvl" >> "$STATE"; sync
+  echo "    $res" | tee -a "$REPORT"
+  journalctl -k --no-pager -S "$since" -p warning \
+    | grep -v 'GFX0._DSM\|exresop\|dsopcode\|psparse' | tail -15 | sed 's/^/    /' | tee -a "$REPORT"
+  case "$res" in PASS) ;; *) break ;; esac
+done
+chown "$U": "$REPORT" 2>/dev/null
+echo "Report saved: $REPORT"

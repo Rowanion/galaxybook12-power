@@ -1,0 +1,5 @@
+#!/bin/sh
+# Firmware may restore its own power limits on resume; re-apply ours.
+case "$1" in
+  post) /usr/bin/systemctl --no-block start galaxybook-ac-power.service ;;
+esac

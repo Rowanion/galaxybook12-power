@@ -1,0 +1,6 @@
+# Galaxy Book tablet: the power button only wakes the tablet. Pressing it to
+# wake is also delivered as a key press, and with 'suspend' GNOME immediately
+# put the tablet back to sleep. Default for all users and the login screen;
+# anyone can still change it in Settings > Power.
+[org/gnome/settings-daemon/plugins/power]
+power-button-action='nothing'

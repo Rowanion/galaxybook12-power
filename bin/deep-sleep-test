@@ -1,0 +1,91 @@
+#!/bin/bash
+# Test suspend-to-RAM (S3 "deep") versus the default s2idle on this tablet.
+#
+# WARNING (SM-W720, BIOS P04HAC 2018): real S3 never resumes; the tablet has to
+# be forced off. All pm_test stages pass (see suspend-bisect), so it is the
+# firmware. Do NOT use --enable. s2idle + SATA DevSleep (install.sh) is the fix.
+#
+#   sudo ./deep-sleep-test              # 30 min deep suspend, then report
+#   sudo ./deep-sleep-test 60           # 60 min
+#   sudo ./deep-sleep-test 30 s2idle    # baseline with the current default
+#   sudo ./deep-sleep-test --enable     # make deep permanent (after a good test)
+#   sudo ./deep-sleep-test --disable    # go back to s2idle
+#
+# The tablet wakes on its own via the RTC alarm; the power button also wakes it.
+# Unplug the charger for a meaningful drain number. Nothing is changed
+# permanently unless you pass --enable.
+set -u
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+DROPIN=/etc/systemd/sleep.conf.d/50-galaxybook-deep.conf
+BAT=/sys/class/power_supply/BAT1
+
+case "${1:-}" in
+  --enable)
+    mkdir -p "$(dirname "$DROPIN")"
+    printf '[Sleep]\n# S3 instead of s2idle: s2idle never reaches S0ix on this tablet\nMemorySleepMode=deep\n' > "$DROPIN"
+    echo "Enabled: $DROPIN (takes effect on the next suspend)."; exit 0 ;;
+  --disable)
+    rm -f "$DROPIN"; echo s2idle > /sys/power/mem_sleep
+    echo "Disabled: back to s2idle."; exit 0 ;;
+esac
+
+MIN="${1:-30}"; MODE="${2:-deep}"
+case "$MODE" in deep|s2idle) ;; *) echo "mode must be deep or s2idle"; exit 2 ;; esac
+grep -qw "$MODE" /sys/power/mem_sleep || { echo "Firmware does not offer $MODE"; exit 1; }
+
+U="${SUDO_USER:-root}"; H="$(getent passwd "$U" | cut -d: -f6)"
+REPORT="$H/sleep-test-$MODE-$(date +%Y%m%d-%H%M).log"
+TMPD="$(mktemp -d)"; trap 'rm -rf "$TMPD"' EXIT
+
+snapshot() {
+  echo "video nodes:   $(ls /dev/video* 2>/dev/null | wc -l)   media nodes: $(ls /dev/media* 2>/dev/null | wc -l)"
+  echo "sound cards:   $(grep -c ']:' /proc/asound/cards)"
+  echo "accelerometer: $(cat /sys/bus/iio/devices/iio:device*/name 2>/dev/null | paste -sd' ')"
+  echo "accel raw x/y/z: $(cat /sys/bus/iio/devices/iio:device*/in_accel_{x,y,z}_raw 2>/dev/null | paste -sd' ')"
+  echo "inputs:        $(grep '^N: Name' /proc/bus/input/devices | sed 's/N: Name=//' | paste -sd',')"
+  echo "network:       $(nmcli -t -f DEVICE,STATE dev 2>/dev/null | grep -v '^lo' | paste -sd' ')"
+  echo "cameras:       $(cam -l 2>/dev/null | grep -c "^[0-9]*:")"
+}
+
+snapshot > "$TMPD/before"
+c0=$(cat $BAT/charge_now); f=$(cat $BAT/charge_full); p0=$(cat $BAT/capacity); t0=$(date +%s)
+{
+echo "=== Galaxy Book sleep test: $MODE for $MIN min  ($(date))"
+echo "kernel $(uname -r)"
+[ "$(cat /sys/class/power_supply/ADP1/online)" = 1 ] && \
+  echo "WARNING: charger is plugged in; the drain number below is meaningless."
+echo "--- before"; cat $TMPD/before
+} | tee "$REPORT"
+
+OLD="$(sed -E 's/.*\[([a-z0-9]+)\].*/\1/' /sys/power/mem_sleep)"
+echo "$MODE" > /sys/power/mem_sleep
+MARK="gb-sleep-test-$$"; logger -t gb-sleep "$MARK start"
+sync
+echo ">>> Suspending now. Wakes by itself in $MIN min (or press the power button)."
+rtcwake -m mem -s $((MIN * 60)) >/dev/null
+sleep 8   # let devices settle after resume
+echo "$OLD" > /sys/power/mem_sleep
+
+{
+t1=$(date +%s); c1=$(cat $BAT/charge_now); p1=$(cat $BAT/capacity)
+el=$((t1 - t0))
+echo "--- after (slept ~$((el / 60)) min)"
+snapshot > $TMPD/after; cat $TMPD/after
+echo "--- differences (before → after):"
+diff $TMPD/before $TMPD/after | grep -v '^accel raw' | sed 's/^/  /' || true
+echo "  (accel raw values are expected to differ slightly)"
+echo "--- battery: ${p0}% → ${p1}%"
+if [ "$el" -gt 0 ]; then
+  awk -v a="$c0" -v b="$c1" -v f="$f" -v s="$el" 'BEGIN{d=(a-b)/f*100; printf "    drop %.1f%% in %.0f min = %.2f %%/hour  (resolution is 1%%)\n", d, s/60, d/(s/3600)}'
+fi
+echo "--- mode actually used:"
+journalctl -k --no-pager -S "-$((el + 60))s" | grep -E 'PM: suspend entry|ACPI: PM: Waking|PM: suspend exit' | sed 's/^/  /'
+echo "--- kernel errors since suspend (empty is good):"
+journalctl -k --no-pager -S "-$((el + 60))s" -p err | grep -v 'GFX0._DSM\|exresop\|dsopcode\|psparse' | tail -25 | sed 's/^/  /'
+echo
+echo "Now check by hand: touch works / rotate the tablet / play a sound / Wi-Fi / camera app."
+echo "Baseline for comparison: s2idle drained about 3 %/hour on 2026-11-10."
+echo "If all good:  sudo $(realpath "$0") --enable"
+} | tee -a "$REPORT"
+chown "$U": "$REPORT" 2>/dev/null
+echo "Report saved: $REPORT"

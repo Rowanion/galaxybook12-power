@@ -1,0 +1,61 @@
+#!/bin/bash
+# Find out why s2idle never reaches S0ix (the chipset's deep idle state).
+#
+#   sudo ./s0ix-check          # 60 s s2idle (the normal, safe sleep mode)
+#   sudo ./s0ix-check 120
+#
+# Wakes by itself (RTC); the power button works too. Reports S0ix residency
+# and which chipset IP blocks / power-gating / LTR settings were blocking it.
+set -u
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+SEC="${1:-60}"
+U="${SUDO_USER:-root}"; H="$(getent passwd "$U" | cut -d: -f6)"
+REPORT="$H/s0ix-check-$(date +%Y%m%d-%H%M).log"
+D=/sys/kernel/debug/pmc_core
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+[ -d "$D" ] || { echo "No $D (intel_pmc_core not loaded?)"; exit 1; }
+
+rd() { cat "$1" 2>/dev/null || echo "n/a"; }
+OLD_MS="$(sed -E 's/.*\[([a-z0-9]+)\].*/\1/' /sys/power/mem_sleep)"
+OLD_DBG="$(rd /sys/power/pm_debug_messages)"
+trap 'echo "$OLD_MS" > /sys/power/mem_sleep; echo "$OLD_DBG" > /sys/power/pm_debug_messages 2>/dev/null' EXIT
+
+{
+echo "=== S0ix check $(date)  kernel $(uname -r)  sleep ${SEC}s s2idle"
+echo "charger online: $(rd /sys/class/power_supply/ADP1/online)"
+echo "--- before"
+s0=$(rd $D/slp_s0_residency_usec); li=$(rd /sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us)
+lc=$(rd /sys/devices/system/cpu/cpuidle/low_power_idle_cpu_residency_us)
+echo "slp_s0_residency_usec=$s0  low_power_idle system=$li cpu=$lc"
+} | tee "$REPORT"
+s0=$(rd $D/slp_s0_residency_usec); li=$(rd /sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us)
+lc=$(rd /sys/devices/system/cpu/cpuidle/low_power_idle_cpu_residency_us)
+
+echo 1 > /sys/power/pm_debug_messages 2>/dev/null
+echo s2idle > /sys/power/mem_sleep
+since="$(date '+%F %T')"
+sync
+echo ">>> s2idle for ${SEC}s ..."
+rtcwake -m mem -s "$SEC" >/dev/null
+sleep 3
+
+{
+echo "--- after"
+s1=$(rd $D/slp_s0_residency_usec); li1=$(rd /sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us)
+lc1=$(rd /sys/devices/system/cpu/cpuidle/low_power_idle_cpu_residency_us)
+echo "slp_s0_residency_usec=$s1  low_power_idle system=$li1 cpu=$lc1"
+echo "    S0ix gained: $(( ${s1:-0} - ${s0:-0} )) us   CPU package low-power (PC10) gained: $(( ${lc1:-0} - ${lc:-0} )) us   (of ${SEC}000000)"
+echo
+echo "--- package C-states";            rd $D/package_cstate_show
+echo "--- PCH IP blocks NOT power gated"; grep -i 'not power gated\|: *0$\|No' $D/pch_ip_power_gating_status 2>/dev/null || rd $D/pch_ip_power_gating_status
+echo "--- full PCH IP power gating";    rd $D/pch_ip_power_gating_status
+echo "--- mPHY lanes";                  rd $D/mphy_core_lanes_power_gating_status
+echo "--- PLLs";                        rd $D/pll_status
+echo "--- LTR (latency tolerance per IP)"; rd $D/ltr_show
+echo "--- kernel PM debug messages during suspend"
+journalctl -k --no-pager -S "$since" | grep -iE 'PM:|s2idle|pmc|SLP_S0|S0ix|wakeup|wake up|ACPI: EC|irq|timekeeping' | tail -60
+echo "--- active wakeup sources"
+grep -v ' 0 *0 *0 *0 *0 *0 *0 *0 *0 *0$' /sys/kernel/debug/wakeup_sources 2>/dev/null | sort -k6 -n -r | head -15
+} | tee -a "$REPORT"
+chown "$U": "$REPORT" 2>/dev/null
+echo "Report saved: $REPORT"

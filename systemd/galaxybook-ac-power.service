@@ -1,0 +1,11 @@
+[Unit]
+Description=Galaxy Book: CPU power limit depending on charger state
+After=thermald.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/galaxybook-ac-power
+
+[Install]
+WantedBy=multi-user.target

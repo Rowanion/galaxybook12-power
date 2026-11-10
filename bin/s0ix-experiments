@@ -1,0 +1,74 @@
+#!/bin/bash
+# Find which setting lets s2idle reach S0ix. Each step adds one change
+# (cumulative) and does a 40 s s2idle; the first step where "S0ix gained"
+# is above 0 is the fix. Everything is reverted at the end, and a reboot
+# reverts it too.
+#
+#   sudo ./s0ix-experiments
+#
+# DO NOT press the power button: it wakes by itself every 40 s (6 rounds,
+# about 5 minutes). Pressing the button makes GNOME suspend again.
+set -u
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+SEC=40
+U="${SUDO_USER:-root}"; H="$(getent passwd "$U" | cut -d: -f6)"
+REPORT="$H/s0ix-experiments-$(date +%Y%m%d-%H%M).log"
+D=/sys/kernel/debug/pmc_core
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+[ -r $D/slp_s0_residency_usec ] || { echo "no pmc_core debugfs"; exit 1; }
+
+# remember state for revert
+OLD_MS="$(sed -E 's/.*\[([a-z0-9]+)\].*/\1/' /sys/power/mem_sleep)"
+OLD_ASPM="$(sed -E 's/.*\[([a-z]+)\].*/\1/' /sys/module/pcie_aspm/parameters/policy)"
+declare -A OLD_LPM
+for h in /sys/class/scsi_host/host*; do OLD_LPM[$h]="$(cat $h/link_power_management_policy)"; done
+BT_BLOCKED="$(rfkill -rn -o TYPE,SOFT 2>/dev/null | awk '$1=="bluetooth"{print $2; exit}')"
+MEI_UNLOADED=0
+
+revert() {
+  echo "$OLD_MS" > /sys/power/mem_sleep
+  echo "$OLD_ASPM" > /sys/module/pcie_aspm/parameters/policy 2>/dev/null
+  for h in "${!OLD_LPM[@]}"; do echo "${OLD_LPM[$h]}" > "$h/link_power_management_policy" 2>/dev/null; done
+  [ "$BT_BLOCKED" = unblocked ] && rfkill unblock bluetooth
+  [ $MEI_UNLOADED = 1 ] && modprobe mei_me && modprobe -a mei_hdcp mei_pxp 2>/dev/null
+  echo "(all settings reverted; ltr_ignore stays until reboot)"
+}
+trap revert EXIT
+
+round() {   # round "<description>"
+  local a b
+  a=$(cat $D/slp_s0_residency_usec)
+  echo s2idle > /sys/power/mem_sleep; sync
+  rtcwake -m mem -s $SEC >/dev/null 2>&1
+  sleep 4
+  b=$(cat $D/slp_s0_residency_usec)
+  printf '%-55s S0ix gained: %10d us of %d000000\n' "$1" $((b - a)) $SEC | tee -a "$REPORT"
+  [ $((b - a)) -gt 0 ] && echo "    ^^^ S0ix reached" | tee -a "$REPORT"
+}
+
+echo "=== S0ix experiments $(date)  kernel $(uname -r)" | tee "$REPORT"
+echo "charger online: $(cat /sys/class/power_supply/ADP1/online)" | tee -a "$REPORT"
+
+round "0 baseline"
+
+for h in /sys/class/scsi_host/host*; do echo min_power > "$h/link_power_management_policy" 2>/dev/null; done
+round "1 + SATA link power min_power (DevSleep)"
+
+echo powersupersave > /sys/module/pcie_aspm/parameters/policy 2>/dev/null
+round "2 + PCIe ASPM powersupersave (L1 substates)"
+
+rfkill block bluetooth
+round "3 + Bluetooth off (USB/XHCI)"
+
+for i in 2 4 9; do echo $i > $D/ltr_ignore 2>/dev/null; done   # SATA, XHCI, HD_AUDIO
+round "4 + PMC ignores LTR of SATA/XHCI/HDA"
+
+for m in mei_hdcp mei_pxp mei_wdt; do lsmod | grep -q "^$m " && modprobe -r "$m"; done
+modprobe -r mei_me 2>/dev/null; lsmod | grep -q '^mei_me ' || MEI_UNLOADED=1
+round "5 + Intel ME driver unloaded (mei_me)"
+
+{
+echo "--- PCH IP power gating now (awake):"; cat $D/pch_ip_power_gating_status | grep 'State: On'
+} >> "$REPORT"
+chown "$U": "$REPORT" 2>/dev/null
+echo "Report saved: $REPORT"

@@ -1,0 +1,2 @@
+# Re-apply CPU power limits whenever the charger is plugged or unplugged.
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ACTION=="change", RUN+="/usr/bin/systemctl --no-block start galaxybook-ac-power.service"
