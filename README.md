@@ -77,6 +77,47 @@ immediately. **Fix:** a dconf default (`/etc/dconf/db/local.d/`) sets
 `'nothing'` for all users and the login screen. Suspend via the system menu
 or the screen timeout. Users can still change it in Settings → Power.
 
+## Fedora release upgrades
+
+The camera, audio and accel drivers are DKMS packages (separate repos) and
+rebuild themselves for new kernels. A release upgrade (e.g. 44 → 45) adds three
+risks: a driver patch that no longer applies to the new kernel, the patched
+libcamera (front camera) being versionlocked to the old release, and
+systemd-homed homes, which deserve a backup before any big change.
+
+```bash
+sudo upgrade/pre-upgrade            # target = next release; --releasever N to choose
+sudo dnf upgrade --refresh          # reboot if it installed anything
+sudo dnf system-upgrade download --releasever=45
+sudo dnf offline reboot
+sudo upgrade/post-upgrade           # after the upgrade
+```
+
+`upgrade/pre-upgrade`:
+
+1. Backs up every systemd-homed home (LUKS image, user record, and the
+   machine's homed signing keys `local.private`/`local.public`) to
+   `/var/backups/galaxybook-upgrade/` — a reflink copy on btrfs (instant, no
+   extra space), else a full copy. The homes must be logged out. Use
+   `--backup-dir` for an external drive; a backup on the same disk does not
+   help if the disk dies.
+2. Downloads the target release's `kernel-devel` and test-builds the installed
+   drivers against it. It also caches that kernel's source, so the drivers
+   already build during the offline upgrade (which has no network).
+3. Only if everything passed: removes the libcamera versionlock, so the
+   upgrade can replace the old build.
+
+It upgrades nothing and is safe to re-run. `upgrade/pre-upgrade --kernel-only`
+runs only step 2, without root, and changes nothing — useful to check early
+whether the next release's kernel still works with the drivers.
+
+`upgrade/post-upgrade` checks the drivers (rebuilding missing ones), the
+cameras, the accelerometer, audio, libcamera, the power fixes and the homed
+homes, and lists what is left to do. Typically that is: rebuild libcamera
+(`~/galaxybook12-camera/scripts/install-libcamera.sh` as your user — not
+needed if the new stock libcamera already has the IMX241 helper), and log in
+once as each homed user.
+
 ## Tools (`bin/`, run with sudo)
 
 | tool | what it does |

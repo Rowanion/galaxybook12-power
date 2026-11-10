@@ -1,0 +1,177 @@
+#!/bin/bash
+# Prepare a Galaxy Book 12 for a Fedora release upgrade (dnf system-upgrade).
+#
+#   sudo upgrade/pre-upgrade [--releasever N] [--backup-dir DIR]
+#   upgrade/pre-upgrade --kernel-only [--releasever N]   (no root, changes nothing)
+#
+# 1. Backs up every systemd-homed home (LUKS image + user record + the
+#    machine's homed signing keys). Homes must be logged out.
+# 2. Test-builds the installed Galaxy Book DKMS drivers (camera, audio,
+#    accel) against the target release's kernel-devel, and pre-downloads that
+#    kernel's source, so the drivers already build during the offline upgrade
+#    (no network there).
+# 3. Removes the libcamera versionlock (the patched fc<N> build would
+#    otherwise block or survive the upgrade); post-upgrade rebuilds it.
+# Nothing here upgrades anything. Re-running is safe.
+set -euo pipefail
+
+REL=""; BACKUP_ROOT=""; KERNEL_ONLY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --releasever) REL="${2:?}"; shift 2 ;;
+    --backup-dir) BACKUP_ROOT="${2:?}"; shift 2 ;;
+    --kernel-only) KERNEL_ONLY=1; shift ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+if [ $KERNEL_ONLY = 0 ] && [ "$(id -u)" != 0 ]; then exec sudo "$0" "$@"; fi
+
+CUR="$(. /etc/os-release; echo "$VERSION_ID")"
+REL="${REL:-$((CUR + 1))}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/galaxybook-upgrade}"
+BK="$BACKUP_ROOT/fedora$CUR-to-$REL-$STAMP"
+PKGS=(galaxybook12-camera alc298-galaxybook st-accel-sam0201)
+HELPER=/usr/local/lib/galaxybook-dkms/kernel-src.sh
+fails=0; warns=0
+ok()   { echo "  OK    $*"; }
+warn() { echo "  WARN  $*"; warns=$((warns + 1)); }
+fail() { echo "  FAIL  $*"; fails=$((fails + 1)); }
+
+echo "Fedora $CUR -> $REL"
+
+# ---------------------------------------------------------------- 1. homes
+backup_homes() {
+  echo; echo "== 1. systemd-homed homes -> $BK"
+  local users u img st need avail
+  mapfile -t users < <(homectl list --no-legend 2>/dev/null | awk '{print $1}')
+  if [ ${#users[@]} -eq 0 ]; then ok "no systemd-homed users"; return; fi
+  for u in "${users[@]}"; do
+    st="$(homectl list --no-legend | awk -v u="$u" '$1==u{print $4}')"
+    if [ "$st" != inactive ]; then
+      fail "$u is '$st': log $u out (or reboot) first, then re-run"; return
+    fi
+  done
+  install -d -m 700 "$BK"
+  cp -a /var/lib/systemd/home/. "$BK/var-lib-systemd-home/"   # signing keys + identities
+  for u in "${users[@]}"; do
+    homectl inspect "$u" --json=pretty > "$BK/$u.homectl.json"
+    img="$(homectl inspect "$u" | sed -n 's/^ *Image Path: //p')"
+    if [ -z "$img" ] || [ ! -e "$img" ]; then warn "$u: no image file found (storage not luks/directory?) - only the record was saved"; continue; fi
+    need=$(( $(du -B1 "$img" | cut -f1) )); avail=$(( $(df -B1 --output=avail "$BK" | tail -1) ))
+    # reflink (btrfs: instant, no extra space) when possible; else sparse copy
+    if cp -a --reflink=always "$img" "$BK/" 2>/dev/null; then
+      ok "$u: $img (reflink copy)"
+    elif [ "$need" -lt $(( avail - 5*1024*1024*1024 )) ]; then
+      echo "        copying $img ($(( need / 1024**3 )) GiB in use), this takes a while ..."
+      cp -a --sparse=always "$img" "$BK/" && ok "$u: $img (full copy)"
+    else
+      fail "$u: not enough space in $BK for $img; use --backup-dir on an external drive"
+      continue
+    fi
+    [ "$(stat -c %s "$img")" = "$(stat -c %s "$BK/$(basename "$img")")" ] || fail "$u: backup copy of $img is incomplete"
+  done
+  {
+    echo "Backup made by galaxybook12-power/upgrade/pre-upgrade on $(date)"
+    echo "Restore a home (user logged out, homed stopped):"
+    echo "  systemctl stop systemd-homed"
+    echo "  cp -a --reflink=auto <image> /home/   ;  cp -a var-lib-systemd-home/. /var/lib/systemd/home/"
+    echo "  systemctl start systemd-homed  &&  homectl list"
+    echo "The image stays LUKS-encrypted; the user's password is still needed."
+    echo "local.private is this machine's homed signing key: keep this folder root-only."
+  } > "$BK/RESTORE.txt"
+  chmod -R go-rwx "$BK"
+  echo "        $(du -sh --apparent-size "$BK" | cut -f1) apparent, $(du -sh "$BK" | cut -f1) on disk. Copy it to another drive too if you can."
+}
+
+# ---------------------------------------------------- 2. target kernel test
+test_target_kernel() {
+  echo; echo "== 2. drivers vs. the Fedora $REL kernel"
+  local kver tmp n v src log
+  kver="$(dnf -q repoquery --releasever="$REL" --repo=fedora --repo=updates kernel-devel \
+          --arch=x86_64 --latest-limit=1 --qf '%{version}-%{release}.%{arch}\n' 2>/dev/null | tail -1)"
+  if [ -z "$kver" ]; then fail "could not query Fedora $REL kernel-devel (repos not online yet?)"; return; fi
+  echo "        Fedora $REL kernel: $kver"
+  case "$kver" in *.rc[0-9]*) warn "$kver is a pre-release (rc) kernel: kernel.org has no source tarball for it, so the drivers cannot build (normal for Rawhide, never for a released Fedora)" ;; esac
+  if [ ! -r "$HELPER" ]; then fail "$HELPER missing: install the driver repos first"; return; fi
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"; trap - RETURN' RETURN
+  # without root the shared cache is read-only: use a throwaway one
+  local cache="${GB_CACHE:-/var/cache/galaxybook-kernel-src}"
+  if ! { mkdir -p "$cache" && [ -w "$cache" ]; } 2>/dev/null; then cache="$tmp/cache"; fi
+  export GB_CACHE="$cache"
+  ( cd "$tmp" && dnf -q download --releasever="$REL" --repo=fedora --repo=updates "kernel-devel-$kver" >/dev/null 2>&1 ) \
+    || { fail "could not download kernel-devel-$kver"; return; }
+  mkdir "$tmp/root"; ( cd "$tmp/root" && rpm2cpio "$tmp"/kernel-devel-*.rpm | cpio -idm --quiet )
+  local headers="$tmp/root/usr/src/kernels/$kver"
+  [ -f "$headers/Makefile" ] || { fail "kernel-devel-$kver has no headers at usr/src/kernels/$kver"; return; }
+
+  for n in "${PKGS[@]}"; do
+    v="$(dkms status -m "$n" 2>/dev/null | sed -n "s|^$n/\([^,:]*\)[,:].*|\1|p" | sort -uV | tail -1)"
+    [ -n "$v" ] || { echo "        $n: not installed, skipped"; continue; }
+    src="/usr/src/$n-$v"; log="$tmp/$n.log"
+    cp -a "$src" "$tmp/$n"
+    # build against the extracted headers instead of /lib/modules/<kver>/build
+    sed -i 's|^HEADERS="/lib/modules/\$KVER/build"$|HEADERS="${GB_HEADERS:-/lib/modules/$KVER/build}"|' "$tmp/$n/dkms-make.sh"
+    grep -q 'GB_HEADERS' "$tmp/$n/dkms-make.sh" || { fail "$n: unexpected dkms-make.sh layout"; continue; }
+    if GB_HEADERS="$headers" GB_HELPER="$HELPER" JOBS="$(nproc)" bash "$tmp/$n/dkms-make.sh" "$kver" >"$log" 2>&1; then
+      ok "$n/$v builds for $kver"
+    elif grep -q 'Entering directory' "$log"; then
+      # patches applied and guards passed; only compiling with THIS release's
+      # gcc against the next release's headers failed - usually a compiler
+      # version mismatch, not a driver problem
+      warn "$n/$v: patches apply, but the test compile failed (likely compiler mismatch, see below)"
+      grep -m3 -E 'error|Error' "$log" | sed 's/^/          /'
+      cp "$log" "/tmp/pre-upgrade-$n.log" 2>/dev/null && echo "          full log: /tmp/pre-upgrade-$n.log"
+    else
+      fail "$n/$v: does NOT apply/build for $kver - the patches need updating before upgrading:"
+      tail -5 "$log" | sed 's/^/          /'
+      cp "$log" "/tmp/pre-upgrade-$n.log" 2>/dev/null && echo "          full log: /tmp/pre-upgrade-$n.log"
+    fi
+  done
+  # the source tarball is now in the cache (as root) -> builds work offline
+  local ks="${kver%%-*}"
+  if [ "$cache" != "$tmp/cache" ] && [ -f "$cache/linux-$ks.tar.xz" ]; then
+    ok "linux-$ks source cached: the offline upgrade can build the drivers"
+  else
+    warn "linux-$ks source not cached (not run as root?): drivers build after the first networked boot instead"
+  fi
+}
+
+# ------------------------------------------------------------ 3. libcamera
+unlock_libcamera() {
+  echo; echo "== 3. libcamera versionlock"
+  local locked
+  locked="$(dnf versionlock list 2>/dev/null | sed -n 's/^Package name: \(.*\)$/\1/p' | grep -E '^(python3-)?libcamera' || true)"
+  if [ -z "$locked" ]; then ok "no libcamera versionlock"; return; fi
+  [ -d "$BK" ] || install -d -m 700 "$BK"
+  echo "$locked" > "$BK/libcamera-versionlock.txt"
+  # shellcheck disable=SC2086
+  dnf -q versionlock delete $locked >/dev/null
+  ok "unlocked: $(echo $locked)  (the front camera may stop working until post-upgrade rebuilds libcamera)"
+}
+
+if [ $KERNEL_ONLY = 1 ]; then
+  test_target_kernel
+else
+  backup_homes
+  test_target_kernel
+  [ $fails = 0 ] && unlock_libcamera || echo -e "\n== 3. libcamera versionlock: left in place because of the failures above"
+fi
+
+echo
+if [ $fails -gt 0 ]; then
+  echo "NOT READY: $fails problem(s) above. Do not upgrade yet."; exit 1
+fi
+[ $warns -gt 0 ] && echo "Ready, with $warns warning(s) above." || echo "Ready."
+[ $KERNEL_ONLY = 1 ] && exit 0
+cat <<EOF
+
+Upgrade (charger connected; takes a while):
+  sudo dnf upgrade --refresh                        # if this installs anything, reboot first
+  sudo dnf system-upgrade download --releasever=$REL
+  sudo dnf offline reboot
+After the upgrade, log in as $(logname 2>/dev/null || echo "your user") and run:
+  sudo ~/galaxybook12-power/upgrade/post-upgrade
+Backup: $BK
+EOF

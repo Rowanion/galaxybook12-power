@@ -1,0 +1,135 @@
+#!/bin/bash
+# Check a Galaxy Book 12 after a Fedora release upgrade and repair what can be
+# repaired automatically.
+#   sudo upgrade/post-upgrade
+# - DKMS drivers (camera, audio, accel) for the running kernel: rebuilds
+#   missing ones with galaxybook-dkms-catchup
+# - libcamera front-camera helper: tells you to rebuild it if it is missing
+# - power fixes (AC power cap, S0ix SATA policy, power button)
+# - systemd-homed homes
+# Prints OK / WARN / FAIL per item; changes nothing else.
+set -uo pipefail
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+U="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+UH="$(getent passwd "$U" | cut -d: -f6)"
+K="$(uname -r)"
+PKGS=(galaxybook12-camera alc298-galaxybook st-accel-sam0201)
+fails=0; warns=0; todo=()
+ok()   { echo "  OK    $*"; }
+warn() { echo "  WARN  $*"; warns=$((warns + 1)); }
+fail() { echo "  FAIL  $*"; fails=$((fails + 1)); }
+
+echo "Fedora $(. /etc/os-release; echo "$VERSION_ID"), kernel $K"
+
+# ---------------------------------------------------------------- drivers
+echo; echo "== DKMS drivers"
+pkg_ok() { [ -n "$(dkms status -m "$1" -k "$K" 2>/dev/null | grep ': installed')" ]; }
+missing=()
+for n in "${PKGS[@]}"; do
+  [ -n "$(dkms status -m "$n" 2>/dev/null)" ] || { echo "        $n: not installed here, skipped"; continue; }
+  pkg_ok "$n" || missing+=("$n")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+  echo "        not built for $K: ${missing[*]} -> running galaxybook-dkms-catchup"
+  /usr/local/sbin/galaxybook-dkms-catchup || true
+  rebuilt=1
+fi
+for n in "${PKGS[@]}"; do
+  [ -n "$(dkms status -m "$n" 2>/dev/null)" ] || continue
+  if pkg_ok "$n"; then ok "$n built for $K"
+  else fail "$n not built for $K (log: /var/lib/dkms/$n/*/build/make.log)"; fi
+done
+[ "${rebuilt:-0}" = 1 ] && todo+=("reboot once (drivers were just rebuilt), then run this again")
+
+# loaded from extra/ (= our build) and working
+chk_mod() {  # chk_mod <module> <what>
+  local f; f="$(modinfo -k "$K" -n "$1" 2>/dev/null)"
+  case "$f" in */extra/*) ;; *) fail "$2: $1 resolves to ${f:-nothing}, not our extra/ build"; return 1 ;; esac
+  grep -q "^${1//-/_} " /proc/modules || { [ "${rebuilt:-0}" = 1 ] && warn "$2: $1 not loaded yet (reboot)" || fail "$2: $1 not loaded"; return 1; }
+}
+if chk_mod snd_hda_codec_alc269 audio; then
+  grep -q ' alc298_book12_' /proc/kallsyms && ok "audio: Galaxy Book 12 quirk loaded" || fail "audio: module loaded without the Galaxy Book 12 quirk"
+fi
+if chk_mod st_accel_i2c accelerometer; then
+  grep -qx lis2hh12 /sys/bus/iio/devices/*/name 2>/dev/null && ok "accelerometer: lis2hh12 present (rotation)" \
+    || fail "accelerometer: no lis2hh12 IIO device"
+fi
+if chk_mod imx258 camera; then
+  ncam="$(cam -l 2>/dev/null | grep -c 'camera (')"
+  case "$ncam" in
+    2) ok "cameras: back + front" ;;
+    1) warn "cameras: only 1 found by libcamera (front needs the libcamera helper, see below)" ;;
+    *) fail "cameras: libcamera finds $ncam" ;;
+  esac
+fi
+
+# --------------------------------------------------------------- libcamera
+echo; echo "== libcamera (front camera IMX241 helper)"
+ipa=/usr/lib64/libcamera/ipa/ipa_ipu3.so
+lcv="$(rpm -q --qf '%{version}-%{release}' libcamera 2>/dev/null)"
+if grep -aqi imx241 "$ipa" 2>/dev/null; then
+  case "$lcv" in
+    *gb12cam*) ok "patched libcamera $lcv" ;;
+    *) ok "stock libcamera $lcv already contains the IMX241 helper: no rebuild needed (keep it unlocked)" ;;
+  esac
+  case "$lcv" in *gb12cam*)
+    [ -n "$(dnf versionlock list 2>/dev/null | grep -x 'Package name: libcamera')" ] \
+      || warn "patched libcamera is not versionlocked (re-run install-libcamera.sh to lock it)" ;;
+  esac
+else
+  warn "libcamera $lcv lacks the IMX241 helper: front camera unusable"
+  todo+=("rebuild libcamera (as $U, not root): ~/galaxybook12-camera/scripts/install-libcamera.sh")
+fi
+case "$lcv" in *.fc$(( $(. /etc/os-release; echo "$VERSION_ID") - 1 )).*)
+  warn "libcamera is still the previous release's build ($lcv)"
+  [[ " ${todo[*]} " == *install-libcamera* ]] || todo+=("rebuild libcamera (as $U, not root): ~/galaxybook12-camera/scripts/install-libcamera.sh") ;;
+esac
+
+# ------------------------------------------------------------------ power
+echo; echo "== power fixes"
+systemctl is-enabled -q galaxybook-ac-power.service && ok "galaxybook-ac-power.service enabled" || fail "galaxybook-ac-power.service not enabled"
+# shellcheck disable=SC1091
+. /etc/galaxybook-power.conf 2>/dev/null || true
+online="$(cat /sys/class/power_supply/ADP*/online 2>/dev/null | head -1)"
+pl1="$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null)"
+if [ "$online" = 1 ]; then want="${AC_PL1:-7}"; where="on AC"; else want="${BAT_PL1:-15}"; where="on battery"; fi
+[ "$pl1" = $(( want * 1000000 )) ] && ok "CPU limit ${want} W $where" || fail "CPU limit is ${pl1:-?} uW $where, expected $(( want * 1000000 ))"
+if command -v tuned-adm >/dev/null && systemctl is-active -q tuned; then
+  tuned-adm active 2>/dev/null | grep -q 'post-loaded profile: galaxybook-s0ix' \
+    && ok "TuneD post-loaded profile galaxybook-s0ix active" || fail "TuneD post-loaded profile galaxybook-s0ix not active (re-run install.sh)"
+else
+  fail "TuneD is not running: the sleep fix (SATA min_power) depends on it"
+fi
+pol="$(cat /sys/class/scsi_host/host*/link_power_management_policy 2>/dev/null | sort -u | paste -sd' ')"
+[[ " $pol " == *" min_power "* ]] && ok "SATA link power: $pol" || fail "SATA link power: '$pol', expected min_power"
+[ -f /etc/dconf/db/local.d/50-galaxybook-power-button ] && [ /etc/dconf/db/local -nt /etc/dconf/db/local.d/50-galaxybook-power-button ] \
+  && ok "power button default 'nothing' (dconf)" || fail "power-button dconf default missing or not compiled (re-run install.sh)"
+sleep_mode="$(cat /sys/power/mem_sleep 2>/dev/null)"
+[[ "$sleep_mode" == *"[s2idle]"* ]] && ok "sleep mode s2idle" || warn "sleep mode: $sleep_mode (S3/deep hangs on this tablet)"
+
+# ------------------------------------------------------------------ homed
+echo; echo "== systemd-homed"
+systemctl is-active -q systemd-homed && ok "systemd-homed running" || fail "systemd-homed not running"
+for f in /var/lib/systemd/home/local.private /var/lib/systemd/home/local.public; do
+  [ -s "$f" ] || fail "$f missing (restore it from the pre-upgrade backup)"
+done
+while read -r u _ _ st _; do
+  [ -n "$u" ] || continue
+  img="$(homectl inspect "$u" 2>/dev/null | sed -n 's/^ *Image Path: //p')"
+  if [ -n "$img" ] && [ ! -e "$img" ]; then fail "$u: image $img missing"
+  else ok "$u: $st${img:+, image $img present}"; fi
+  todo+=("log in as $u once to confirm the home unlocks")
+done < <(homectl list --no-legend 2>/dev/null)
+
+# ------------------------------------------------------------------- rest
+echo; echo "== leftovers"
+old="$(rpm -qa --qf '%{name}-%{version}-%{release}\n' | grep -c "\.fc$(( $(. /etc/os-release; echo "$VERSION_ID") - 1 ))" )"
+[ "$old" -le 5 ] && ok "$old package(s) from the previous release left" \
+  || warn "$old packages from the previous release left (see 'dnf repoquery --extras'; usually harmless)"
+
+echo
+[ $fails -eq 0 ] && echo "Result: OK ($warns warning(s))" || echo "Result: $fails problem(s), $warns warning(s)"
+if [ ${#todo[@]} -gt 0 ]; then
+  echo "To do:"; printf '  - %s\n' "${todo[@]}"
+fi
+[ $fails -eq 0 ]
