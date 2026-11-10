@@ -123,8 +123,8 @@ done < <(homectl list --no-legend 2>/dev/null)
 
 # ------------------------------------------------------------------- rest
 echo; echo "== leftovers"
-old="$(rpm -qa --qf '%{name}-%{version}-%{release}\n' | grep -c "\.fc$(( $(. /etc/os-release; echo "$VERSION_ID") - 1 ))" )"
-[ "$old" -le 5 ] && ok "$old package(s) from the previous release left" \
+old="$(rpm -qa --qf '%{name}-%{version}-%{release}\n' | grep -v '^kernel' | grep -c "\.fc$(( $(. /etc/os-release; echo "$VERSION_ID") - 1 ))" )"
+[ "$old" -le 5 ] && ok "$old package(s) from the previous release left (kernels not counted)" \
   || warn "$old packages from the previous release left (see 'dnf repoquery --extras'; usually harmless)"
 
 echo
