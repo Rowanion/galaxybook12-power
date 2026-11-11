@@ -92,11 +92,25 @@ this panel. Installed by `install.sh`; on its own: `sudo brightness/install.sh`
 `sudo /usr/local/sbin/galaxybook12-brightness set 60` (range 1–101; below 40
 some panels may flicker).
 
-**thermald:** in `--adaptive` mode (Fedora's default), thermald treats the
-backlight as a cooling device and pushes it back up towards 100 % every 4 s,
-overriding the slider (unnoticed before, because the panel ignored that value
-anyway). The installer adds a drop-in that makes the backlight read-only for
-thermald only; its CPU thermal control is unchanged.
+**thermald:** the firmware's thermal tables (DPTF, `INT3400` `data_vault`,
+PSVT tables `Camera`/`Clamshell`/`NonCamera`/`highperf`) list the display
+(`\_SB_.PCI0.DPLY`) as a passive cooling device for the skin sensor `SEN2`:
+dim the screen when the tablet gets hot in your hands — a comfort feature;
+the CPU (`B0D4`) entries are the actual heat protection. For a cool tablet the
+table says "display: MAX". Windows' DPTF treats that as a ceiling (the user may
+go lower); thermald `--adaptive` (Fedora's default) treats it as a target and
+sets the backlight back to 100 % in 1 % steps every 4 s, even at a cool 32 °C
+skin temperature, overriding the slider. Before this service that value never
+reached the panel, so nobody noticed.
+
+The installer therefore adds a drop-in
+(`/etc/systemd/system/thermald.service.d/50-galaxybook-no-backlight.conf`)
+that makes the backlight read-only for thermald only. Lost: dimming the screen
+when the skin gets hot — which never worked on this panel under Linux anyway.
+Unchanged: thermald's CPU throttling (still adaptive) and the hardware's own
+protections (CPU self-throttling, firmware critical shutdown). Possible later
+improvement: cap the brightness in this service above a skin temperature taken
+from the same PSVT table, the way Windows does.
 
 Change from the original: the service sleeps until the slider actually moves
 (the kernel notifies `actual_brightness` changes) instead of checking it 10
