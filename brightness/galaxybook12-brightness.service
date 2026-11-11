@@ -1,0 +1,18 @@
+[Unit]
+Description=Samsung Galaxy Book 12 AMOLED brightness control
+Documentation=https://github.com/fxjosemi/Samsung-Galaxy-Book-12-Linux
+After=systemd-udev-settle.service
+ConditionPathExists=/sys/class/backlight/intel_backlight
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/galaxybook12-brightness watch 3 10
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=graphical.target
