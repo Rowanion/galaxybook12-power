@@ -276,7 +276,9 @@ static int watch_brightness(const char *aux_path, const char *connector,
              BACKLIGHT_PATH);
     snprintf(actual_path, sizeof(actual_path), "%s/actual_brightness",
              BACKLIGHT_PATH);
-    snprintf(enabled_path, sizeof(enabled_path), "%s/enabled", connector);
+    if (snprintf(enabled_path, sizeof(enabled_path), "%s/enabled", connector) >=
+        (int)sizeof(enabled_path))
+        return 1;
     if (read_number(maximum_path, &maximum) < 0 || maximum <= 0)
         return 1;
 
