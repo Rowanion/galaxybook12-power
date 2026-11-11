@@ -107,6 +107,10 @@ pol="$(cat /sys/class/scsi_host/host*/link_power_management_policy 2>/dev/null |
 if [ -e /etc/systemd/system/galaxybook12-brightness.service ]; then
   systemctl is-active -q galaxybook12-brightness.service && ok "AMOLED brightness service running" \
     || fail "AMOLED brightness service not running (journalctl -u galaxybook12-brightness)"
+  ro="/etc/systemd/system/thermald.service.d/50-galaxybook-no-backlight.conf"
+  grep -qx "ReadOnlyPaths=-$(realpath /sys/class/backlight/intel_backlight)" "$ro" 2>/dev/null \
+    && ok "thermald kept off the backlight" \
+    || fail "thermald may override the brightness slider: backlight path changed or $ro missing (re-run brightness/install.sh)"
 else
   warn "AMOLED brightness service not installed: the brightness slider does nothing (brightness/install.sh)"
 fi

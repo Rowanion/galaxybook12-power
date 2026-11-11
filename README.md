@@ -92,6 +92,12 @@ this panel. Installed by `install.sh`; on its own: `sudo brightness/install.sh`
 `sudo /usr/local/sbin/galaxybook12-brightness set 60` (range 1–101; below 40
 some panels may flicker).
 
+**thermald:** in `--adaptive` mode (Fedora's default), thermald treats the
+backlight as a cooling device and pushes it back up towards 100 % every 4 s,
+overriding the slider (unnoticed before, because the panel ignored that value
+anyway). The installer adds a drop-in that makes the backlight read-only for
+thermald only; its CPU thermal control is unchanged.
+
 Change from the original: the service sleeps until the slider actually moves
 (the kernel notifies `actual_brightness` changes) instead of checking it 10
 times a second, and a system-sleep hook makes it re-initialise the panel
