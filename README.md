@@ -138,6 +138,11 @@ its resume hook wrote the 10.6 amplifier setup to the wrong I²C addresses on
 every wake. The Book 12 audio driver is in the separate `galaxybook12-audio`
 repo.
 
+## AI assistance
+
+This repository was developed with AI assistance (Claude by Anthropic). Every
+change was reviewed and tested on real SM-W720 hardware.
+
 ## License
 
 GPL-2.0.
