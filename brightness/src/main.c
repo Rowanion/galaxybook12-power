@@ -239,15 +239,28 @@ static long long suspended_ms(void)
 /*
  * Event-driven loop (galaxybook12-power change): the kernel sysfs_notify()s
  * actual_brightness on every backlight change, so the loop sleeps in poll()
- * until the slider moves, instead of waking every 100 ms. SIGUSR1 (sent by
- * the system-sleep hook after resume) forces re-initialisation at once; a
- * 5 s timeout and the suspend-time check below are the fallback.
+ * until the slider moves, instead of waking every 100 ms (it still wakes
+ * every 500 ms to check whether the screen was switched off/on). SIGUSR1
+ * (sent by the system-sleep hook after resume) forces re-initialisation at
+ * once; the suspend-time check below is the fallback.
  */
-static int watch_brightness(const char *aux_path, int profile, int minimum)
+static bool connector_enabled(const char *enabled_path)
+{
+    char state[32];
+
+    /* unreadable: assume on, i.e. behave like before this check existed */
+    return read_text(enabled_path, state, sizeof(state)) < 0 ||
+           strcmp(state, "enabled") == 0;
+}
+
+static int watch_brightness(const char *aux_path, const char *connector,
+                            int profile, int minimum)
 {
     char brightness_path[PATH_MAX];
     char maximum_path[PATH_MAX];
     char actual_path[PATH_MAX];
+    char enabled_path[PATH_MAX];
+    bool panel_was_on = true;
     aux_t aux = -1;
     displayBrightness_t *display = NULL;
     long maximum;
@@ -263,6 +276,7 @@ static int watch_brightness(const char *aux_path, int profile, int minimum)
              BACKLIGHT_PATH);
     snprintf(actual_path, sizeof(actual_path), "%s/actual_brightness",
              BACKLIGHT_PATH);
+    snprintf(enabled_path, sizeof(enabled_path), "%s/enabled", connector);
     if (read_number(maximum_path, &maximum) < 0 || maximum <= 0)
         return 1;
 
@@ -298,6 +312,25 @@ static int watch_brightness(const char *aux_path, int profile, int minimum)
         }
         last_suspended = now_suspended;
         reinit_requested = 0;
+
+        /* Screen off (DPMS, e.g. on lock): the panel loses its unlock and
+         * private settings. Leave it alone while off; re-initialise when it
+         * comes back on. Not notified by the kernel, so checked every 500 ms
+         * (a sysfs read, no AUX traffic). */
+        if (!connector_enabled(enabled_path)) {
+            panel_was_on = false;
+            poll(NULL, 0, 500);
+            continue;
+        }
+        if (!panel_was_on && display) {
+            free(display);
+            display = NULL;
+            dpAuxClose(aux);
+            aux = -1;
+            previous = -1;
+            set_profile = true;
+        }
+        panel_was_on = true;
 
         /* re-arm the sysfs notification: read the attribute before poll() */
         if (notify_fd >= 0) {
@@ -341,7 +374,8 @@ static int watch_brightness(const char *aux_path, int profile, int minimum)
         if (level != target)
             timeout = 5;                    /* fading: next step in 5 ms */
         else if (notify_fd >= 0)
-            timeout = 5000;                 /* idle: wait for a change */
+            timeout = 500;                  /* idle: wait for a change; also
+                                               the screen-off check interval */
         else
             timeout = 100;                  /* no notification: old polling */
         {
@@ -418,7 +452,7 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 2;
         }
-        return watch_brightness(aux_path, profile, minimum);
+        return watch_brightness(aux_path, connector, profile, minimum);
     }
     if (!strcmp(argv[1], "set")) {
         int level;

@@ -118,7 +118,9 @@ from the same PSVT table, the way Windows does.
 Change from the original: the service sleeps until the slider actually moves
 (the kernel notifies `actual_brightness` changes) instead of checking it 10
 times a second, and a system-sleep hook makes it re-initialise the panel
-immediately after resume.
+immediately after resume. It also re-initialises the panel when the screen
+comes back on after being switched off (e.g. on lock): the panel forgets its
+unlock and settings when powered down, after which the slider had no effect.
 
 Credit: the service is from
 [fxjosemi/Samsung-Galaxy-Book-12-Linux](https://github.com/fxjosemi/Samsung-Galaxy-Book-12-Linux)
