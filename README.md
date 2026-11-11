@@ -105,7 +105,10 @@ reached the panel, so nobody noticed.
 
 The installer therefore adds a drop-in
 (`/etc/systemd/system/thermald.service.d/50-galaxybook-no-backlight.conf`)
-that makes the backlight read-only for thermald only. Lost: dimming the screen
+that makes the backlight read-only for thermald only — both the backlight
+itself and the firmware's display cooling device `DPLY`
+(`/sys/class/thermal/cooling_device*`), through which thermald reaches the
+backlight via ACPI as well. Lost: dimming the screen
 when the skin gets hot — which never worked on this panel under Linux anyway.
 Unchanged: thermald's CPU throttling (still adaptive) and the hardware's own
 protections (CPU self-throttling, firmware critical shutdown). Possible later
