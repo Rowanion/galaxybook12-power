@@ -1,8 +1,9 @@
 # galaxybook12-power
 
 Power fixes for the Samsung Galaxy Book 12 (SM-W720) on Fedora: battery that
-drains while charging, battery that drains during sleep, and a power button
-that sends the tablet straight back to sleep. Developed and measured on an
+drains while charging, battery that drains during sleep, a power button
+that sends the tablet straight back to sleep, and a brightness slider that
+does nothing. Developed and measured on an
 SM-W720 (i5-7200U, BIOS `P04HAC.000.180220`), Fedora 44, kernel 7.3.
 
 ```bash
@@ -76,6 +77,32 @@ key press; with `power-button-action='suspend'` it suspends again
 immediately. **Fix:** a dconf default (`/etc/dconf/db/local.d/`) sets
 `'nothing'` for all users and the login screen. Suspend via the system menu
 or the screen timeout. Users can still change it in Settings → Power.
+
+## 4. Brightness slider does nothing
+
+The SM-W720 has a Samsung AMOLED panel (EDID `SDC a029`). Linux shows a
+brightness slider (`intel_backlight`), but the panel ignores it: its
+brightness is set through private panel registers over the eDP AUX channel.
+
+**Fix:** `brightness/` — a small service that follows the slider and writes the
+panel's own brightness levels 10–101 (with a short fade), computed from the
+panel's factory calibration. It only runs on a Galaxy Book 12 with exactly
+this panel. Installed by `install.sh`; on its own: `sudo brightness/install.sh`
+/ `sudo brightness/uninstall.sh`. Manual test:
+`sudo /usr/local/sbin/galaxybook12-brightness set 60` (range 1–101; below 40
+some panels may flicker).
+
+Change from the original: the service sleeps until the slider actually moves
+(the kernel notifies `actual_brightness` changes) instead of checking it 10
+times a second, and a system-sleep hook makes it re-initialise the panel
+immediately after resume.
+
+Credit: the service is from
+[fxjosemi/Samsung-Galaxy-Book-12-Linux](https://github.com/fxjosemi/Samsung-Galaxy-Book-12-Linux)
+(commit `9245ef7`); the panel protocol, calibration algorithm and register
+tables are from Aurélien Croc's
+[SamsungGalaxyBook12](https://github.com/Teetoow/SamsungGalaxyBook12).
+GPL-2.0-only.
 
 ## Fedora release upgrades
 

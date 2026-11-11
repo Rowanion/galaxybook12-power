@@ -104,6 +104,12 @@ pol="$(cat /sys/class/scsi_host/host*/link_power_management_policy 2>/dev/null |
 [[ " $pol " == *" min_power "* ]] && ok "SATA link power: $pol" || fail "SATA link power: '$pol', expected min_power"
 [ -f /etc/dconf/db/local.d/50-galaxybook-power-button ] && [ /etc/dconf/db/local -nt /etc/dconf/db/local.d/50-galaxybook-power-button ] \
   && ok "power button default 'nothing' (dconf)" || fail "power-button dconf default missing or not compiled (re-run install.sh)"
+if [ -e /etc/systemd/system/galaxybook12-brightness.service ]; then
+  systemctl is-active -q galaxybook12-brightness.service && ok "AMOLED brightness service running" \
+    || fail "AMOLED brightness service not running (journalctl -u galaxybook12-brightness)"
+else
+  warn "AMOLED brightness service not installed: the brightness slider does nothing (brightness/install.sh)"
+fi
 sleep_mode="$(cat /sys/power/mem_sleep 2>/dev/null)"
 [[ "$sleep_mode" == *"[s2idle]"* ]] && ok "sleep mode s2idle" || warn "sleep mode: $sleep_mode (S3/deep hangs on this tablet)"
 

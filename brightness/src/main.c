@@ -11,7 +11,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
+#include <poll.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -36,10 +38,18 @@
 
 static volatile sig_atomic_t running = 1;
 
+static volatile sig_atomic_t reinit_requested = 0;
+
 static void stop_handler(int signal_number)
 {
     (void)signal_number;
     running = 0;
+}
+
+static void reinit_handler(int signal_number)
+{
+    (void)signal_number;
+    reinit_requested = 1;
 }
 
 static int read_text(const char *path, char *buffer, size_t size)
@@ -214,38 +224,71 @@ static int mapped_level(long brightness, long maximum, int minimum)
                             maximum / 2) / maximum);
 }
 
+/* Time spent suspended so far (ms): CLOCK_BOOTTIME counts suspend,
+ * CLOCK_MONOTONIC does not, so this only grows across a suspend. */
+static long long suspended_ms(void)
+{
+    struct timespec boot, mono;
+
+    clock_gettime(CLOCK_BOOTTIME, &boot);
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    return (boot.tv_sec - mono.tv_sec) * 1000LL +
+           (boot.tv_nsec - mono.tv_nsec) / 1000000;
+}
+
+/*
+ * Event-driven loop (galaxybook12-power change): the kernel sysfs_notify()s
+ * actual_brightness on every backlight change, so the loop sleeps in poll()
+ * until the slider moves, instead of waking every 100 ms. SIGUSR1 (sent by
+ * the system-sleep hook after resume) forces re-initialisation at once; a
+ * 5 s timeout and the suspend-time check below are the fallback.
+ */
 static int watch_brightness(const char *aux_path, int profile, int minimum)
 {
     char brightness_path[PATH_MAX];
     char maximum_path[PATH_MAX];
+    char actual_path[PATH_MAX];
     aux_t aux = -1;
     displayBrightness_t *display = NULL;
     long maximum;
     int previous = -1;
     bool set_profile = true;
-    struct timespec idle_pause = {.tv_sec = 0, .tv_nsec = 100000000};
-    struct timespec fade_pause = {.tv_sec = 0, .tv_nsec = 5000000};
-    struct timespec previous_time;
+    int notify_fd;
+    long long last_suspended;
+    struct sigaction action;
 
     snprintf(brightness_path, sizeof(brightness_path), "%s/brightness",
              BACKLIGHT_PATH);
     snprintf(maximum_path, sizeof(maximum_path), "%s/max_brightness",
              BACKLIGHT_PATH);
+    snprintf(actual_path, sizeof(actual_path), "%s/actual_brightness",
+             BACKLIGHT_PATH);
     if (read_number(maximum_path, &maximum) < 0 || maximum <= 0)
         return 1;
 
-    signal(SIGINT, stop_handler);
-    signal(SIGTERM, stop_handler);
-    clock_gettime(CLOCK_BOOTTIME, &previous_time);
+    /* no SA_RESTART: signals must interrupt poll() */
+    memset(&action, 0, sizeof(action));
+    sigemptyset(&action.sa_mask);
+    action.sa_handler = stop_handler;
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
+    action.sa_handler = reinit_handler;
+    sigaction(SIGUSR1, &action, NULL);
+
+    notify_fd = open(actual_path, O_RDONLY | O_CLOEXEC);
+    if (notify_fd < 0)
+        fprintf(stderr, "Cannot open %s (%s): polling every 100 ms instead.\n",
+                actual_path, strerror(errno));
+    last_suspended = suspended_ms();
     while (running) {
         long brightness;
         int level;
         int target;
-        struct timespec current_time;
+        int timeout;
+        long long now_suspended = suspended_ms();
 
-        clock_gettime(CLOCK_BOOTTIME, &current_time);
-        if (current_time.tv_sec - previous_time.tv_sec > 2 && display) {
-            /* CLOCK_BOOTTIME includes suspend: reopen AUX and recalibrate. */
+        if ((now_suspended - last_suspended > 500 || reinit_requested) && display) {
+            /* resumed from suspend: reopen AUX and recalibrate */
             free(display);
             display = NULL;
             dpAuxClose(aux);
@@ -253,7 +296,19 @@ static int watch_brightness(const char *aux_path, int profile, int minimum)
             previous = -1;
             set_profile = true;
         }
-        previous_time = current_time;
+        last_suspended = now_suspended;
+        reinit_requested = 0;
+
+        /* re-arm the sysfs notification: read the attribute before poll() */
+        if (notify_fd >= 0) {
+            char discard[32];
+
+            if (lseek(notify_fd, 0, SEEK_SET) < 0 ||
+                read(notify_fd, discard, sizeof(discard)) < 0) {
+                close(notify_fd);
+                notify_fd = -1;
+            }
+        }
 
         if (!display && open_panel(aux_path, &aux, &display) < 0) {
             sleep(1);
@@ -283,8 +338,20 @@ static int watch_brightness(const char *aux_path, int profile, int minimum)
             previous = level;
             set_profile = false;
         }
-        nanosleep(level == target ? &idle_pause : &fade_pause, NULL);
+        if (level != target)
+            timeout = 5;                    /* fading: next step in 5 ms */
+        else if (notify_fd >= 0)
+            timeout = 5000;                 /* idle: wait for a change */
+        else
+            timeout = 100;                  /* no notification: old polling */
+        {
+            struct pollfd watch = {.fd = notify_fd, .events = POLLPRI | POLLERR};
+
+            poll(&watch, notify_fd >= 0 ? 1 : 0, timeout);
+        }
     }
+    if (notify_fd >= 0)
+        close(notify_fd);
     free(display);
     dpAuxClose(aux);
     return running ? 1 : 0;

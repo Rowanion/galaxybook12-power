@@ -1,0 +1,6 @@
+#!/bin/sh
+# systemd-sleep hook: after resume, tell the AMOLED brightness service to
+# re-initialise the panel at once (it would otherwise notice within 5 s).
+case "$1" in
+  post) systemctl kill --signal=SIGUSR1 --kill-whom=main galaxybook12-brightness.service 2>/dev/null || true ;;
+esac

@@ -1,6 +1,6 @@
 [Unit]
 Description=Samsung Galaxy Book 12 AMOLED brightness control
-Documentation=https://github.com/fxjosemi/Samsung-Galaxy-Book-12-Linux
+Documentation=https://github.com/Rowanion/galaxybook12-power
 After=systemd-udev-settle.service
 ConditionPathExists=/sys/class/backlight/intel_backlight
 

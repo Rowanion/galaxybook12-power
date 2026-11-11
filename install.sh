@@ -3,6 +3,7 @@
 #  - CPU power cap while charging (udev + service + resume hook)
 #  - SATA DevSleep via TuneD post-loaded profile, so s2idle reaches S0ix
 #  - power button only wakes (all users + login screen)
+#  - AMOLED brightness: the brightness slider controls the panel
 set -euo pipefail; cd "$(dirname "$0")"
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 install -m 755 bin/galaxybook-ac-power /usr/local/sbin/
@@ -31,3 +32,5 @@ journalctl -u galaxybook-ac-power -n 1 -o cat
 grep -H . /sys/class/powercap/intel-rapl:0/constraint_[01]_power_limit_uw /sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw
 tuned-adm active
 echo "SATA LPM: $(cat /sys/class/scsi_host/host*/link_power_management_policy | paste -sd' ')"
+# AMOLED brightness: make the brightness slider control the panel
+brightness/install.sh
